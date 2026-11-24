@@ -1,13 +1,15 @@
 #!/usr/bin/env python3
-"""Endereza páginas escaneadas y recorta únicamente la tabla de InfoAuto.
+"""Endereza páginas escaneadas, recorta y normaliza la tabla.
 
 Uso:
-  python infoautos_preparar.py rotar
-  python infoautos_preparar.py recortar --debug
-  python infoautos_preparar.py ambos --padding 2
+  python preparar.py rotar
+  python preparar.py recortar --debug
+  python preparar.py ambos --padding 2
+  python preparar.py normalizar
 
 Flujo por carpetas (los nombres de archivo se conservan en cada paso):
   imagenes/ --rotar--> rotadas/ --recortar--> recortadas/
+  recortadas/ --normalizar--> normalizadas/ (2070 × 3000 px)
   Los diagnósticos (--debug) se guardan en debug/.
 
 Antes de recortar se valida la relación de aspecto contra RATIO_REF (±2%,
@@ -26,7 +28,10 @@ EXTS = {'.png', '.jpg', '.jpeg', '.tif', '.tiff', '.webp'}
 DIR_IMAGENES = Path('imagenes')
 DIR_ROTADAS = Path('rotadas')
 DIR_RECORTADAS = Path('recortadas')
+DIR_NORMALIZADAS = Path('normalizadas')
 DIR_DEBUG = Path('debug')
+ANCHO_NORMALIZADO = 2070
+ALTO_NORMALIZADO = 3000
 # Relación ancho/alto de referencia: mediana de las tablas aprobadas en
 # validadas/ (0.6889-0.6919, desvío ±0.13%).
 RATIO_REF = 0.690
@@ -58,7 +63,46 @@ def line_masks(gray):
     return horizontal, vertical
 
 
+def angulos_por_banda(gray):
+    """Estima la inclinación que concentra la tinta en filas de cada banda."""
+    h, w = gray.shape
+    if w < 800:
+        return []
+    escala = 800 / w
+    reducida = cv2.resize(gray, (800, max(1, round(h * escala))),
+                          interpolation=cv2.INTER_AREA)
+    tinta = binary_ink(reducida)
+    h = tinta.shape[0]
+    angulos = []
+    for inicio, fin in ((.10, .35), (.35, .65), (.65, .93)):
+        banda = tinta[round(inicio*h):round(fin*h), 96:720]
+        alto, ancho = banda.shape
+        if alto < 10 or not np.any(banda):
+            continue
+        margen = int(np.ceil(ancho * np.tan(np.deg2rad(5))))
+
+        def concentracion(angulo):
+            pendiente = -np.tan(np.deg2rad(angulo))
+            matriz = np.array([[1, 0, 0], [pendiente, 1, margen]])
+            alineada = cv2.warpAffine(banda, matriz, (ancho, alto + 2*margen))
+            return alineada.sum(axis=1).var()
+
+        grueso = max(np.linspace(-5, 5, 41), key=concentracion)
+        finos = np.linspace(max(-5, grueso-.25), min(5, grueso+.25), 21)
+        angulos.append(float(max(finos, key=concentracion)))
+    return angulos
+
+
 def detect_angle(gray):
+    angulos = angulos_por_banda(gray)
+    if len(angulos) == 3 and max(angulos) - min(angulos) <= .15:
+        angulo = float(np.median(angulos))
+        return angulo if abs(angulo) >= .08 else 0.0
+
+    return detectar_angulo_hough(gray)
+
+
+def detectar_angulo_hough(gray):
     h, w = gray.shape
     horizontal, _ = line_masks(gray)
     segments = cv2.HoughLinesP(horizontal, 1, np.pi / 1800,
@@ -310,11 +354,36 @@ def recortar_tabla(path, outdir, debug=False, padding=2,
     print(f'{path.name}: límites={bounds}, recorte={x1-x0}x{y1-y0} -> {target}')
 
 
+def normalizar_imagen(path, outdir):
+    """Ajusta el tamaño del recorte y lo centra sobre un fondo blanco."""
+    imagen = cv2.imread(str(path), cv2.IMREAD_UNCHANGED)
+    if imagen is None:
+        raise ValueError('No se pudo leer la imagen')
+    alto, ancho = imagen.shape[:2]
+    escala = min(ANCHO_NORMALIZADO / ancho, ALTO_NORMALIZADO / alto)
+    ancho_ajustado = max(1, round(ancho * escala))
+    alto_ajustado = max(1, round(alto * escala))
+    interpolacion = cv2.INTER_AREA if escala <= 1 else cv2.INTER_CUBIC
+    ajustada = cv2.resize(imagen, (ancho_ajustado, alto_ajustado),
+                          interpolation=interpolacion)
+    x = (ANCHO_NORMALIZADO - ancho_ajustado) // 2
+    y = (ALTO_NORMALIZADO - alto_ajustado) // 2
+    forma = (ALTO_NORMALIZADO, ANCHO_NORMALIZADO) + imagen.shape[2:]
+    blanco = 1.0 if np.issubdtype(imagen.dtype, np.floating) else np.iinfo(imagen.dtype).max
+    lienzo = np.full(forma, blanco, dtype=imagen.dtype)
+    lienzo[y:y + alto_ajustado, x:x + ancho_ajustado] = ajustada
+    outdir.mkdir(parents=True, exist_ok=True)
+    destino = outdir / path.name
+    if not cv2.imwrite(str(destino), lienzo):
+        raise ValueError(f'No se pudo guardar la imagen en {destino}')
+    print(f'{path.name}: normalizada a {ANCHO_NORMALIZADO}x{ALTO_NORMALIZADO} -> {destino}')
+
+
 def main():
     p = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    p.add_argument('accion', choices=['rotar', 'recortar', 'ambos'],
+    p.add_argument('accion', choices=['rotar', 'recortar', 'ambos', 'normalizar'],
                    help='rotar: imagenes/ -> rotadas/; recortar: rotadas/ -> recortadas/; '
-                        'ambos: flujo completo')
+                        'ambos: rotar y recortar; normalizar: recortadas/ -> normalizadas/')
     p.add_argument('--debug', action='store_true', help='Guardar imagen con rectángulo de recorte en debug/')
     p.add_argument('--angle', type=float, help='Ángulo manual en grados (rotar/ambos); omitir para autodetección')
     p.add_argument('--padding', type=int, default=2, help='Margen alrededor de la tabla en píxeles')
@@ -327,10 +396,20 @@ def main():
     if args.angle is not None and args.accion == 'recortar':
         print('ADVERTENCIA: --angle se ignora en recortar; las imágenes de rotadas/ ya están enderezadas')
     errors = 0
-    if args.accion == 'recortar':
+    if args.accion == 'normalizar':
+        paths = listar_imagenes(DIR_RECORTADAS)
+        if not paths:
+            p.error('No hay imágenes en recortadas/, ejecutá primero: python preparar.py recortar')
+        for path in paths:
+            try:
+                normalizar_imagen(path, DIR_NORMALIZADAS)
+            except Exception as exc:
+                errors += 1
+                print(f'ERROR {path.name}: {exc}')
+    elif args.accion == 'recortar':
         paths = listar_imagenes(DIR_ROTADAS)
         if not paths:
-            p.error('No hay imágenes en rotadas/, ejecutá primero: python infoautos_preparar.py rotar')
+            p.error('No hay imágenes en rotadas/, ejecutá primero: python preparar.py rotar')
         for path in paths:
             try:
                 recortar_tabla(path, DIR_RECORTADAS, args.debug, args.padding,
